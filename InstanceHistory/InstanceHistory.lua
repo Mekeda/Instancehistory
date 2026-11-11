@@ -5,6 +5,7 @@ local MAX_LEVEL = 60
 local INSTANCE_CAP = 5
 
 local DEFAULT_ACCENT = { r = 0.09, g = 0.52, b = 0.82 }
+local DEFAULT_BAR_TEX = "Interface\\TargetingFrame\\UI-StatusBar"
 
 local defaults = {
     locked = false,
@@ -28,7 +29,7 @@ local defaults = {
     fontPath = STANDARD_TEXT_FONT,
     fontOutline = "OUTLINE",
     barTextureName = "Blizzard",
-    barTexturePath = "Interface\\TargetingFrame\\UI-StatusBar",
+    barTexturePath = DEFAULT_BAR_TEX,
     useClassColor = false,
     accentR = DEFAULT_ACCENT.r,
     accentG = DEFAULT_ACCENT.g,
@@ -57,6 +58,10 @@ local wasInInstance = false
 local currentSessionEntry = nil
 local currentFullEntry = nil
 local currentZoneInTime = nil
+
+-- Reusable tables to avoid per-tick garbage collection
+local activeHistory = {}
+local remainingList = {}
 
 -- Forward declarations
 local ApplyLayout
@@ -91,19 +96,17 @@ local function RGBToHex(r, g, b)
     return string.format("%02x%02x%02x", r, g, b)
 end
 
+local function GetClassColorTable(classFile)
+    if not classFile then return nil end
+    return (CUSTOM_CLASS_COLORS and CUSTOM_CLASS_COLORS[classFile])
+        or (RAID_CLASS_COLORS and RAID_CLASS_COLORS[classFile])
+        or (C_ClassColor and C_ClassColor.GetClassColor and C_ClassColor.GetClassColor(classFile))
+end
+
 local function GetPlayerClassColor()
     local _, classFile = UnitClass("player")
-    if classFile then
-        local colorTable = (CUSTOM_CLASS_COLORS and CUSTOM_CLASS_COLORS[classFile])
-            or (RAID_CLASS_COLORS and RAID_CLASS_COLORS[classFile])
-        if colorTable then
-            return colorTable.r, colorTable.g, colorTable.b
-        end
-        if C_ClassColor and C_ClassColor.GetClassColor then
-            local c = C_ClassColor.GetClassColor(classFile)
-            if c then return c.r, c.g, c.b end
-        end
-    end
+    local c = GetClassColorTable(classFile)
+    if c then return c.r, c.g, c.b end
     return DEFAULT_ACCENT.r, DEFAULT_ACCENT.g, DEFAULT_ACCENT.b
 end
 
@@ -132,7 +135,7 @@ local builtinFonts = {
 }
 
 local builtinTextures = {
-    { name = "Blizzard",         path = "Interface\\TargetingFrame\\UI-StatusBar" },
+    { name = "Blizzard",         path = DEFAULT_BAR_TEX },
     { name = "Flat (ElvUI)",     path = "Interface\\Buttons\\WHITE8X8" },
     { name = "Raid Bar",         path = "Interface\\RaidFrame\\Raid-Bar-Hp-Fill" },
     { name = "Skills Bar",       path = "Interface\\PaperDollInfoFrame\\UI-Character-Skills-Bar" },
@@ -146,80 +149,56 @@ local outlineOptions = {
 }
 
 local function GetLSM()
-    if LibStub then
-        return LibStub("LibSharedMedia-3.0", true)
-    end
-    return nil
+    return LibStub and LibStub("LibSharedMedia-3.0", true) or nil
 end
 
-local function GetFontList()
-    local list = {}
-    local seen = {}
+local function SortByNameLower(a, b)
+    return a.name:lower() < b.name:lower()
+end
+
+local function GetMediaList(mediaType, builtins)
+    local list, seen = {}, {}
     local lsm = GetLSM()
     if lsm then
-        for _, name in ipairs(lsm:List("font")) do
-            local path = lsm:Fetch("font", name, true)
+        for _, name in ipairs(lsm:List(mediaType)) do
+            local path = lsm:Fetch(mediaType, name, true)
             if path then
                 table.insert(list, { name = name, path = path })
                 seen[name] = true
             end
         end
     end
-    for _, item in ipairs(builtinFonts) do
+    for _, item in ipairs(builtins) do
         if not seen[item.name] then
             table.insert(list, item)
         end
     end
-    table.sort(list, function(a, b) return a.name:lower() < b.name:lower() end)
+    table.sort(list, SortByNameLower)
     return list
 end
 
-local function GetTextureList()
-    local list = {}
-    local seen = {}
+local function GetFontList() return GetMediaList("font", builtinFonts) end
+local function GetTextureList() return GetMediaList("statusbar", builtinTextures) end
+
+local function ResolveMediaPath(mediaType, nameKey, pathKey, fallback)
+    if not db then return fallback end
     local lsm = GetLSM()
-    if lsm then
-        for _, name in ipairs(lsm:List("statusbar")) do
-            local path = lsm:Fetch("statusbar", name, true)
-            if path then
-                table.insert(list, { name = name, path = path })
-                seen[name] = true
-            end
+    if lsm and db[nameKey] then
+        local fetched = lsm:Fetch(mediaType, db[nameKey], true)
+        if fetched then
+            db[pathKey] = fetched
+            return fetched
         end
     end
-    for _, item in ipairs(builtinTextures) do
-        if not seen[item.name] then
-            table.insert(list, item)
-        end
-    end
-    table.sort(list, function(a, b) return a.name:lower() < b.name:lower() end)
-    return list
+    return db[pathKey] or fallback
 end
 
 local function ResolveFontPath()
-    if not db then return STANDARD_TEXT_FONT end
-    local lsm = GetLSM()
-    if lsm and db.fontName then
-        local fetched = lsm:Fetch("font", db.fontName, true)
-        if fetched then
-            db.fontPath = fetched
-            return fetched
-        end
-    end
-    return db.fontPath or STANDARD_TEXT_FONT
+    return ResolveMediaPath("font", "fontName", "fontPath", STANDARD_TEXT_FONT)
 end
 
 local function ResolveTexturePath()
-    if not db then return "Interface\\TargetingFrame\\UI-StatusBar" end
-    local lsm = GetLSM()
-    if lsm and db.barTextureName then
-        local fetched = lsm:Fetch("statusbar", db.barTextureName, true)
-        if fetched then
-            db.barTexturePath = fetched
-            return fetched
-        end
-    end
-    return db.barTexturePath or "Interface\\TargetingFrame\\UI-StatusBar"
+    return ResolveMediaPath("statusbar", "barTextureName", "barTexturePath", DEFAULT_BAR_TEX)
 end
 
 local function ApplyConfiguredFont(fontString, size, overrideOutline)
@@ -237,12 +216,8 @@ end
 --------------------------------------------------------------------------------
 local function MakeSystemPattern(globalString, unanchored)
     if not globalString then return nil end
-    local escaped = globalString:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1")
-    local body = escaped:gsub("%%%%s", "(.+)")
-    if unanchored then
-        return body
-    end
-    return "^" .. body .. "$"
+    local body = globalString:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1"):gsub("%%%%s", "(.+)")
+    return unanchored and body or ("^" .. body .. "$")
 end
 
 local PAT_RESET_SUCCESS       = MakeSystemPattern(INSTANCE_RESET_SUCCESS, false)
@@ -252,23 +227,18 @@ local PAT_RESET_OFFLINE       = MakeSystemPattern(INSTANCE_RESET_FAILED_OFFLINE,
 local PAT_RESET_ZONING        = MakeSystemPattern(INSTANCE_RESET_FAILED_ZONING, false)
 
 local function GetCharKey()
-    local name = UnitName("player") or "Unknown"
-    local realm = GetRealmName() or "Realm"
-    return name .. "-" .. realm
+    return (UnitName("player") or "Unknown") .. "-" .. (GetRealmName() or "Realm")
 end
 
 local function FormatTimeRemaining(seconds)
     seconds = math.max(0, math.floor(seconds + 0.5))
     local mins = math.floor(seconds / 60)
     local secs = seconds % 60
+    local sLabel = (secs == 1) and "Sec" or "Secs"
     if mins > 0 then
-        local mLabel = (mins == 1) and "Min" or "Mins"
-        local sLabel = (secs == 1) and "Sec" or "Secs"
-        return string.format("%d %s %d %s", mins, mLabel, secs, sLabel)
-    else
-        local sLabel = (secs == 1) and "Sec" or "Secs"
-        return string.format("%d %s", secs, sLabel)
+        return string.format("%d %s %d %s", mins, (mins == 1) and "Min" or "Mins", secs, sLabel)
     end
+    return string.format("%d %s", secs, sLabel)
 end
 
 local function FormatShortDuration(seconds)
@@ -281,32 +251,30 @@ local function FormatShortDuration(seconds)
         return string.format("%dh %dm", hrs, mins)
     elseif mins > 0 then
         return string.format("%dm %ds", mins, secs)
-    else
-        return string.format("%ds", secs)
     end
+    return string.format("%ds", secs)
 end
 
 local function FormatColoredChar(charStr, classFile, level)
     local shortName = charStr and charStr:match("^([^%-]+)") or (charStr or "Unknown")
-    local colorHex = "ffcccccc"
-    if classFile then
-        local c = (CUSTOM_CLASS_COLORS and CUSTOM_CLASS_COLORS[classFile])
-            or (RAID_CLASS_COLORS and RAID_CLASS_COLORS[classFile])
-        if c then
-            colorHex = c.colorStr or ("ff" .. RGBToHex(c.r, c.g, c.b))
-        end
-    end
+    local c = GetClassColorTable(classFile)
+    local colorHex = c and (c.colorStr or ("ff" .. RGBToHex(c.r, c.g, c.b))) or "ffcccccc"
     if level and level > 0 then
         return string.format("|c%s%s|r |cff888888(%d)|r", colorHex, shortName, level)
     end
     return string.format("|c%s%s|r", colorHex, shortName)
 end
 
-local function PruneAndGetActiveHistory()
-    if not db or not db.history then return {} end
-    local now = time()
-    local active = {}
+local function SortByEntryTime(a, b)
+    return a.time < b.time
+end
 
+local function PruneAndGetActiveHistory()
+    wipe(activeHistory)
+    if not db or not db.history then return activeHistory end
+
+    local now = time()
+    local removed = false
     for i = #db.history, 1, -1 do
         local entry = db.history[i]
         if not entry or not entry.time or (now - entry.time) >= HOUR_SECONDS then
@@ -314,20 +282,38 @@ local function PruneAndGetActiveHistory()
                 currentSessionEntry = nil
             end
             table.remove(db.history, i)
+            removed = true
         end
     end
 
-    table.sort(db.history, function(a, b)
-        return a.time < b.time
-    end)
+    if removed then
+        table.sort(db.history, SortByEntryTime)
+    end
 
     for _, entry in ipairs(db.history) do
         if db.accountWide or entry.char == charKey then
-            table.insert(active, entry)
+            table.insert(activeHistory, entry)
         end
     end
 
-    return active
+    return activeHistory
+end
+
+local function AddActiveLocksToTooltip(active)
+    if #active == 0 then
+        GameTooltip:AddLine("No instances entered in the last hour.", 0.7, 0.7, 0.7)
+        return
+    end
+    local now = time()
+    for i, entry in ipairs(active) do
+        local rem = math.max(0, (entry.time + HOUR_SECONDS) - now)
+        GameTooltip:AddDoubleLine(
+            string.format("%d. %s", i, entry.name or "Unknown Instance"),
+            FormatTimeRemaining(rem),
+            0.92, 0.92, 0.92,
+            0.75, 0.75, 0.75
+        )
+    end
 end
 
 local function GetGroupChatChannel()
@@ -365,8 +351,21 @@ local function TriggerLimitNotification(count)
     else
         return
     end
-
     PrintAddonMsg(string.format("|cffffcc00%s (%d/%d in the last hour)|r", msg, count, INSTANCE_CAP))
+end
+
+local function ResetBarPosition()
+    if not db then return end
+    db.point, db.relativePoint, db.xOfs, db.yOfs = defaults.point, defaults.relativePoint, defaults.xOfs, defaults.yOfs
+    ApplyLayout()
+end
+
+local function ClearActiveHistory()
+    if not db then return end
+    wipe(db.history)
+    currentSessionEntry = nil
+    UpdateDisplay()
+    if UpdateHistoryWindow then UpdateHistoryWindow() end
 end
 
 --------------------------------------------------------------------------------
@@ -374,7 +373,6 @@ end
 --------------------------------------------------------------------------------
 local function SetElvBorder(f, r, g, b, a)
     if not f._elvBorders then
-        f._elvBorders = {}
         local top = f:CreateTexture(nil, "BORDER")
         top:SetPoint("TOPLEFT", f, "TOPLEFT", 0, 0)
         top:SetPoint("TOPRIGHT", f, "TOPRIGHT", 0, 0)
@@ -397,8 +395,9 @@ local function SetElvBorder(f, r, g, b, a)
 
         f._elvBorders = { top, bottom, left, right }
     end
+    a = a or 1
     for _, tex in ipairs(f._elvBorders) do
-        tex:SetColorTexture(r, g, b, a or 1)
+        tex:SetColorTexture(r, g, b, a)
     end
 end
 
@@ -482,11 +481,7 @@ local function CreateElvCheckbox(parent, label, tooltip, getVal, setVal, onChang
         local r, g, b = GetAccentColor()
         fill:SetColorTexture(r, g, b, 1)
         ApplyConfiguredFont(text, 11)
-        if getVal() then
-            fill:Show()
-        else
-            fill:Hide()
-        end
+        fill:SetShown(getVal() and true or false)
     end
     btn.Refresh = Refresh
 
@@ -553,13 +548,13 @@ border:SetColorTexture(0, 0, 0, 1)
 local barBg = barContainer:CreateTexture(nil, "BACKGROUND", nil, -1)
 barBg:SetPoint("TOPLEFT", barContainer, "TOPLEFT", 1, -1)
 barBg:SetPoint("BOTTOMRIGHT", barContainer, "BOTTOMRIGHT", -1, 1)
-barBg:SetTexture("Interface\\TargetingFrame\\UI-StatusBar")
+barBg:SetTexture(DEFAULT_BAR_TEX)
 barBg:SetVertexColor(0.18, 0.18, 0.18, 0.92)
 
 local barFill = barContainer:CreateTexture(nil, "ARTWORK", nil, 0)
 barFill:SetPoint("TOPRIGHT", barContainer, "TOPRIGHT", -1, -1)
 barFill:SetPoint("BOTTOMRIGHT", barContainer, "BOTTOMRIGHT", -1, 1)
-barFill:SetTexture("Interface\\TargetingFrame\\UI-StatusBar")
+barFill:SetTexture(DEFAULT_BAR_TEX)
 barFill:SetVertexColor(0.76, 0.76, 0.76, 0.95)
 
 local ticks = {}
@@ -621,10 +616,10 @@ local function UpdateMinimapButtonPosition()
     minimapBtn:SetPoint("CENTER", Minimap, "CENTER", x, y)
 end
 
-local function ShowMinimapTooltip(self)
+local function ShowMinimapTooltip(self, precomputedActive)
     if not db then return end
     local r, g, b, hex = GetAccentColor()
-    local active = PruneAndGetActiveHistory()
+    local active = precomputedActive or PruneAndGetActiveHistory()
     local count = #active
 
     GameTooltip:SetOwner(self, "ANCHOR_LEFT")
@@ -634,21 +629,7 @@ local function ShowMinimapTooltip(self)
         1, 1, 1, 0.85, 0.85, 0.85
     )
 
-    if count == 0 then
-        GameTooltip:AddLine("No instances entered in the last hour.", 0.7, 0.7, 0.7)
-    else
-        local now = time()
-        for i, entry in ipairs(active) do
-            local rem = math.max(0, (entry.time + HOUR_SECONDS) - now)
-            local zoneName = entry.name or "Unknown Instance"
-            GameTooltip:AddDoubleLine(
-                string.format("%d. %s", i, zoneName),
-                FormatTimeRemaining(rem),
-                0.92, 0.92, 0.92,
-                0.75, 0.75, 0.75
-            )
-        end
-    end
+    AddActiveLocksToTooltip(active)
 
     GameTooltip:AddLine(" ")
     GameTooltip:AddDoubleLine("Left-Click:", "Toggle History Window", r, g, b, 0.9, 0.9, 0.9)
@@ -668,7 +649,6 @@ local function CreateMinimapButton()
     minimapBtn:RegisterForDrag("LeftButton")
     minimapBtn:SetHighlightTexture("Interface\\Minimap\\UI-Minimap-ZoomButton-Highlight")
 
-    -- Dark backing disc
     local bg = minimapBtn:CreateTexture(nil, "BACKGROUND")
     bg:SetSize(21, 21)
     bg:SetPoint("TOPLEFT", minimapBtn, "TOPLEFT", 6, -5)
@@ -676,14 +656,12 @@ local function CreateMinimapButton()
     bg:SetVertexColor(0.08, 0.08, 0.08, 0.95)
     minimapBtn.bg = bg
 
-    -- Subtle inner accent ring behind the icon
     local accentRing = minimapBtn:CreateTexture(nil, "BORDER")
     accentRing:SetSize(20, 20)
     accentRing:SetPoint("CENTER", bg, "CENTER", 0, 0)
     accentRing:SetTexture("Interface\\Buttons\\UI-Quickslot2")
     minimapBtn.accentRing = accentRing
 
-    -- Main timepiece/portal icon
     local icon = minimapBtn:CreateTexture(nil, "ARTWORK")
     icon:SetSize(18, 18)
     icon:SetPoint("CENTER", bg, "CENTER", 0, 0)
@@ -691,7 +669,6 @@ local function CreateMinimapButton()
     icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
     minimapBtn.icon = icon
 
-    -- Circular mask if supported by client
     if minimapBtn.CreateMaskTexture then
         local mask = minimapBtn:CreateMaskTexture()
         mask:SetTexture("Interface\\CharacterFrame\\TempPortraitAlphaMask", "CLAMPTOBLACKADDITIVE", "CLAMPTOBLACKADDITIVE")
@@ -699,14 +676,12 @@ local function CreateMinimapButton()
         icon:AddMaskTexture(mask)
     end
 
-    -- Standard Minimap tracking border ring
     local overlay = minimapBtn:CreateTexture(nil, "OVERLAY")
     overlay:SetSize(53, 53)
     overlay:SetPoint("TOPLEFT", minimapBtn, "TOPLEFT", 0, 0)
     overlay:SetTexture("Interface\\Minimap\\MiniMap-TrackingBorder")
     minimapBtn.overlay = overlay
 
-    -- Active Hourly Lock Counter Badge
     local badgeText = minimapBtn:CreateFontString(nil, "OVERLAY")
     badgeText:SetFont(STANDARD_TEXT_FONT, 10, "OUTLINE")
     badgeText:SetPoint("BOTTOMRIGHT", minimapBtn, "BOTTOMRIGHT", -3, 3)
@@ -741,8 +716,7 @@ local function CreateMinimapButton()
             local scale = Minimap:GetEffectiveScale()
             cx, cy = cx / scale, cy / scale
             if mx and my then
-                local angle = math.deg(math.atan2(cy - my, cx - mx)) % 360
-                db.minimapPos = angle
+                db.minimapPos = math.deg(math.atan2(cy - my, cx - mx)) % 360
                 UpdateMinimapButtonPosition()
             end
         end)
@@ -763,35 +737,36 @@ local function CreateMinimapButton()
     end)
 
     RegisterThemeCallback(function()
-        if UpdateMinimapButton then
-            UpdateMinimapButton()
-        end
+        if not minimapBtn or not db then return end
+        local r, g, b = GetAccentColor()
+        minimapBtn.accentRing:SetVertexColor(r, g, b, 0.9)
+        ApplyConfiguredFont(minimapBtn.badgeText, 10, "OUTLINE")
+        UpdateMinimapButtonPosition()
+        UpdateMinimapButton()
     end)
 
     UpdateMinimapButtonPosition()
     return minimapBtn
 end
 
-UpdateMinimapButton = function()
+UpdateMinimapButton = function(precomputedActive)
     if not db then return end
     if not minimapBtn then
         CreateMinimapButton()
+        if not minimapBtn then return end
     end
-    if not minimapBtn then return end
 
-    if db.showMinimap then
-        minimapBtn:Show()
-        UpdateMinimapButtonPosition()
-    else
+    if not db.showMinimap then
         minimapBtn:Hide()
         return
     end
 
-    local r, g, b = GetAccentColor()
-    minimapBtn.accentRing:SetVertexColor(r, g, b, 0.9)
-    ApplyConfiguredFont(minimapBtn.badgeText, 10, "OUTLINE")
+    if not minimapBtn:IsShown() then
+        minimapBtn:Show()
+        UpdateMinimapButtonPosition()
+    end
 
-    local active = PruneAndGetActiveHistory()
+    local active = precomputedActive or PruneAndGetActiveHistory()
     local count = #active
     if count > 0 then
         if count >= INSTANCE_CAP then
@@ -808,7 +783,7 @@ UpdateMinimapButton = function()
     end
 
     if minimapBtn.isHovered and GameTooltip:GetOwner() == minimapBtn then
-        ShowMinimapTooltip(minimapBtn)
+        ShowMinimapTooltip(minimapBtn, active)
     end
 end
 
@@ -847,7 +822,6 @@ local function CreateHistoryWindow()
 
     tinsert(UISpecialFrames, "InstanceHistoryLogFrame")
 
-    -- Draggable Header Bar (respects db.histLocked)
     local header = CreateFrame("Frame", nil, histFrame)
     header:SetPoint("TOPLEFT", histFrame, "TOPLEFT", 1, -1)
     header:SetPoint("TOPRIGHT", histFrame, "TOPRIGHT", -1, -1)
@@ -884,7 +858,6 @@ local function CreateHistoryWindow()
     end)
     closeBtn:SetPoint("RIGHT", header, "RIGHT", -6, 0)
 
-    -- Sub-header Toolbar (Filter + Lock Toggle + Summary + Clear Button)
     local toolbar = CreateFrame("Frame", nil, histFrame)
     toolbar:SetPoint("TOPLEFT", header, "BOTTOMLEFT", 10, -6)
     toolbar:SetPoint("TOPRIGHT", header, "BOTTOMRIGHT", -10, -6)
@@ -937,7 +910,6 @@ local function CreateHistoryWindow()
     end)
     clearAllBtn:SetPoint("RIGHT", toolbar, "RIGHT", 0, 0)
 
-    -- Column Header Row
     local colHeader = CreateFrame("Frame", nil, histFrame)
     colHeader:SetPoint("TOPLEFT", toolbar, "BOTTOMLEFT", 0, -6)
     colHeader:SetPoint("TOPRIGHT", toolbar, "BOTTOMRIGHT", 0, -6)
@@ -952,36 +924,34 @@ local function CreateHistoryWindow()
         return fs
     end
 
-    local colNum    = CreateColHeader("#")
-    local colInst   = CreateColHeader("Instance")
-    local colChar   = CreateColHeader("Character")
-    local colDate   = CreateColHeader("Entered")
-    local colStatus = CreateColHeader("Lock Status")
+    colHeader.cNum    = CreateColHeader("#")
+    colHeader.cInst   = CreateColHeader("Instance")
+    colHeader.cChar   = CreateColHeader("Character")
+    colHeader.cDate   = CreateColHeader("Entered")
+    colHeader.cStatus = CreateColHeader("Lock Status")
+    colHeader.cells   = { colHeader.cNum, colHeader.cInst, colHeader.cChar, colHeader.cDate, colHeader.cStatus }
 
-    -- Clickable '#' Column Header Button to Sort by Number
     local colNumBtn = CreateFrame("Button", nil, colHeader)
-    colNumBtn:SetPoint("TOPLEFT", colNum, "TOPLEFT", 0, 4)
-    colNumBtn:SetPoint("BOTTOMRIGHT", colNum, "BOTTOMRIGHT", 0, -4)
+    colNumBtn:SetPoint("TOPLEFT", colHeader.cNum, "TOPLEFT", 0, 4)
+    colNumBtn:SetPoint("BOTTOMRIGHT", colHeader.cNum, "BOTTOMRIGHT", 0, -4)
     colNumBtn:SetScript("OnClick", function()
         db.histSortAsc = not db.histSortAsc
         histFrame.scrollOffset = 0
         UpdateHistoryWindow()
     end)
     colNumBtn:SetScript("OnEnter", function()
-        colNum:SetTextColor(1, 1, 1, 1)
+        colHeader.cNum:SetTextColor(1, 1, 1, 1)
     end)
     colNumBtn:SetScript("OnLeave", function()
         local r, g, b = GetAccentColor()
-        colNum:SetTextColor(r, g, b, 1)
+        colHeader.cNum:SetTextColor(r, g, b, 1)
     end)
 
-    -- List Container
     local listBox = CreateFrame("Frame", nil, histFrame)
     listBox:SetPoint("TOPLEFT", colHeader, "BOTTOMLEFT", 0, -2)
     listBox:SetPoint("BOTTOMRIGHT", histFrame, "BOTTOMRIGHT", -10, 22)
     SkinElvFrame(listBox, { 0.06, 0.06, 0.06, 0.95 }, ELV_BORDER)
 
-    -- Scrollbar
     local scrollBar = CreateFrame("Slider", nil, listBox)
     scrollBar:SetOrientation("VERTICAL")
     scrollBar:SetPoint("TOPRIGHT", listBox, "TOPRIGHT", -2, -2)
@@ -1002,7 +972,6 @@ local function CreateHistoryWindow()
     emptyText:SetText("No dungeon history recorded yet.")
     emptyText:Hide()
 
-    -- Footer Status & Bottom-Right Resize Grip
     local footerHint = histFrame:CreateFontString(nil, "OVERLAY")
     ApplyConfiguredFont(footerHint, 10)
     footerHint:SetPoint("BOTTOMLEFT", histFrame, "BOTTOMLEFT", 12, 6)
@@ -1013,22 +982,18 @@ local function CreateHistoryWindow()
     resizeGrip:SetPoint("BOTTOMRIGHT", histFrame, "BOTTOMRIGHT", -2, 2)
     resizeGrip:SetFrameLevel(histFrame:GetFrameLevel() + 10)
 
-    local gripLine1 = resizeGrip:CreateTexture(nil, "OVERLAY")
-    gripLine1:SetSize(10, 2)
-    gripLine1:SetPoint("BOTTOMRIGHT", resizeGrip, "BOTTOMRIGHT", -2, 2)
-
-    local gripLine2 = resizeGrip:CreateTexture(nil, "OVERLAY")
-    gripLine2:SetSize(6, 2)
-    gripLine2:SetPoint("BOTTOMRIGHT", resizeGrip, "BOTTOMRIGHT", -2, 6)
-
-    local gripLine3 = resizeGrip:CreateTexture(nil, "OVERLAY")
-    gripLine3:SetSize(2, 2)
-    gripLine3:SetPoint("BOTTOMRIGHT", resizeGrip, "BOTTOMRIGHT", -2, 10)
+    local gripLines = {}
+    for idx, spec in ipairs({ { 10, 2 }, { 6, 6 }, { 2, 10 } }) do
+        local line = resizeGrip:CreateTexture(nil, "OVERLAY")
+        line:SetSize(spec[1], 2)
+        line:SetPoint("BOTTOMRIGHT", resizeGrip, "BOTTOMRIGHT", -2, spec[2])
+        gripLines[idx] = line
+    end
 
     local function ColorGripLines(r, g, b, a)
-        gripLine1:SetColorTexture(r, g, b, a)
-        gripLine2:SetColorTexture(r, g, b, a)
-        gripLine3:SetColorTexture(r, g, b, a)
+        for _, line in ipairs(gripLines) do
+            line:SetColorTexture(r, g, b, a)
+        end
     end
 
     resizeGrip:SetScript("OnEnter", function()
@@ -1052,65 +1017,31 @@ local function CreateHistoryWindow()
 
     histFrame.rows = {}
     histFrame.scrollOffset = 0
-    histFrame.filteredList = {}
+    histFrame.filteredEntries = {}
+    histFrame.filteredIndices = {}
     local isUpdatingScroll = false
 
-    local function LayoutColumns(rowOrHeader, isHeader, totalWidth)
+    local function LayoutColumns(target, totalWidth)
         local usable = math.max(460, totalWidth - 20)
-        local wNum    = 40
-        local wDate   = 130
-        local wStatus = 125
-        local flex    = math.max(120, usable - (wNum + wDate + wStatus))
-        local wInst   = math.floor(flex * 0.56)
-        local wChar   = flex - wInst
+        local wNum, wDate, wStatus = 40, 130, 125
+        local flex  = math.max(120, usable - (wNum + wDate + wStatus))
+        local wInst = math.floor(flex * 0.56)
+        local wChar = flex - wInst
 
-        local xNum    = 8
-        local xInst   = xNum + wNum + 4
-        local xChar   = xInst + wInst + 4
-        local xDate   = xChar + wChar + 4
-        local xStatus = xDate + wDate + 4
-
-        if isHeader then
-            colNum:ClearAllPoints()
-            colNum:SetPoint("LEFT", colHeader, "LEFT", xNum, 0)
-            colNum:SetWidth(wNum)
-
-            colInst:ClearAllPoints()
-            colInst:SetPoint("LEFT", colHeader, "LEFT", xInst, 0)
-            colInst:SetWidth(wInst)
-
-            colChar:ClearAllPoints()
-            colChar:SetPoint("LEFT", colHeader, "LEFT", xChar, 0)
-            colChar:SetWidth(wChar)
-
-            colDate:ClearAllPoints()
-            colDate:SetPoint("LEFT", colHeader, "LEFT", xDate, 0)
-            colDate:SetWidth(wDate)
-
-            colStatus:ClearAllPoints()
-            colStatus:SetPoint("LEFT", colHeader, "LEFT", xStatus, 0)
-            colStatus:SetWidth(wStatus)
-        else
-            rowOrHeader.cNum:SetPoint("LEFT", rowOrHeader, "LEFT", xNum, 0)
-            rowOrHeader.cNum:SetWidth(wNum)
-
-            rowOrHeader.cInst:SetPoint("LEFT", rowOrHeader, "LEFT", xInst, 0)
-            rowOrHeader.cInst:SetWidth(wInst)
-
-            rowOrHeader.cChar:SetPoint("LEFT", rowOrHeader, "LEFT", xChar, 0)
-            rowOrHeader.cChar:SetWidth(wChar)
-
-            rowOrHeader.cDate:SetPoint("LEFT", rowOrHeader, "LEFT", xDate, 0)
-            rowOrHeader.cDate:SetWidth(wDate)
-
-            rowOrHeader.cStatus:SetPoint("LEFT", rowOrHeader, "LEFT", xStatus, 0)
-            rowOrHeader.cStatus:SetWidth(wStatus)
+        local widths = { wNum, wInst, wChar, wDate, wStatus }
+        local x = 8
+        for i, cell in ipairs(target.cells) do
+            local w = widths[i]
+            cell:ClearAllPoints()
+            cell:SetPoint("LEFT", target, "LEFT", x, 0)
+            cell:SetWidth(w)
+            x = x + w + 4
         end
     end
 
     local function ShowRowTooltip(row)
-        if not row.entry then return end
         local e = row.entry
+        if not e then return end
         local r, g, b = GetAccentColor()
         GameTooltip:SetOwner(row, "ANCHOR_RIGHT")
         GameTooltip:AddLine(e.name or "Instance", r, g, b)
@@ -1136,11 +1067,9 @@ local function CreateHistoryWindow()
         row:SetHeight(ROW_HEIGHT)
         row:EnableMouseWheel(true)
 
-        -- Base alternating zebra background
         row.bg = row:CreateTexture(nil, "BACKGROUND")
         row.bg:SetAllPoints(row)
 
-        -- Dedicated persistent hover overlay texture (never wiped by 1s timer updates)
         row.hoverTex = row:CreateTexture(nil, "ARTWORK")
         row.hoverTex:SetAllPoints(row)
         row.hoverTex:Hide()
@@ -1158,6 +1087,7 @@ local function CreateHistoryWindow()
         row.cChar   = MakeCell()
         row.cDate   = MakeCell()
         row.cStatus = MakeCell()
+        row.cells   = { row.cNum, row.cInst, row.cChar, row.cDate, row.cStatus }
 
         row:SetScript("OnEnter", function(self)
             self.isHovered = true
@@ -1192,7 +1122,7 @@ local function CreateHistoryWindow()
         ApplyConfiguredFont(emptyText, 12)
         ApplyConfiguredFont(footerHint, 10)
 
-        for _, colFS in ipairs({ colNum, colInst, colChar, colDate, colStatus }) do
+        for _, colFS in ipairs(colHeader.cells) do
             ApplyConfiguredFont(colFS, 11)
             colFS:SetTextColor(r, g, b, 1)
         end
@@ -1201,11 +1131,9 @@ local function CreateHistoryWindow()
         ColorGripLines(r, g, b, 0.85)
 
         for _, row in ipairs(histFrame.rows) do
-            ApplyConfiguredFont(row.cNum, 11)
-            ApplyConfiguredFont(row.cInst, 11)
-            ApplyConfiguredFont(row.cChar, 11)
-            ApplyConfiguredFont(row.cDate, 11)
-            ApplyConfiguredFont(row.cStatus, 11)
+            for _, cell in ipairs(row.cells) do
+                ApplyConfiguredFont(cell, 11)
+            end
             if row.isHovered then
                 row.hoverTex:SetColorTexture(r, g, b, 0.28)
             end
@@ -1224,7 +1152,6 @@ local function CreateHistoryWindow()
 
         local r, g, b, hex = GetAccentColor()
 
-        -- Update lock state visuals
         if db.histLocked then
             resizeGrip:Hide()
             footerHint:SetText("Window Locked • Scroll wheel to browse")
@@ -1237,9 +1164,13 @@ local function CreateHistoryWindow()
         local listHeight = listBox:GetHeight() or (histFrame:GetHeight() - 115)
         local visibleRows = math.max(1, math.floor((listHeight - 4) / ROW_HEIGHT))
 
-        LayoutColumns(colHeader, true, listWidth)
+        LayoutColumns(colHeader, listWidth)
 
-        local filtered = {}
+        local entries = histFrame.filteredEntries
+        local indices = histFrame.filteredIndices
+        wipe(entries)
+        wipe(indices)
+
         local full = db.fullHistory or {}
         local activeCountLastHour = 0
         local now = time()
@@ -1249,31 +1180,25 @@ local function CreateHistoryWindow()
             startIdx, endIdx, step = 1, #full, 1
         end
 
+        local total = 0
         for i = startIdx, endIdx, step do
             local e = full[i]
-            if e and e.time then
-                if not db.histCurrentCharOnly or e.char == charKey then
-                    table.insert(filtered, { entry = e, chronoIndex = i })
-                    if (now - e.time) < HOUR_SECONDS then
-                        activeCountLastHour = activeCountLastHour + 1
-                    end
+            if e and e.time and (not db.histCurrentCharOnly or e.char == charKey) then
+                total = total + 1
+                entries[total] = e
+                indices[total] = i
+                if (now - e.time) < HOUR_SECONDS then
+                    activeCountLastHour = activeCountLastHour + 1
                 end
             end
         end
-
-        histFrame.filteredList = filtered
-        local total = #filtered
 
         statsText:SetText(string.format(
             "Total Runs: |cffffffff%d|r   •   Active Locks (1h): |cff%s%d/%d|r",
             total, hex, activeCountLastHour, INSTANCE_CAP
         ))
 
-        if total == 0 then
-            emptyText:Show()
-        else
-            emptyText:Hide()
-        end
+        emptyText:SetShown(total == 0)
 
         local maxOffset = math.max(0, total - visibleRows)
         histFrame.scrollOffset = math.max(0, math.min(maxOffset, histFrame.scrollOffset or 0))
@@ -1294,55 +1219,47 @@ local function CreateHistoryWindow()
 
         for i = 1, math.max(#histFrame.rows, visibleRows) do
             local row = GetOrCreateRow(i)
-            if i <= visibleRows then
-                local item = filtered[i + histFrame.scrollOffset]
-                if item then
-                    local e = item.entry
-                    row.entry = e
-                    row.rowIndex = i
-                    row:ClearAllPoints()
-                    row:SetPoint("TOPLEFT", listBox, "TOPLEFT", 2, -2 - ((i - 1) * ROW_HEIGHT))
-                    row:SetPoint("TOPRIGHT", listBox, "TOPRIGHT", rightPad, -2 - ((i - 1) * ROW_HEIGHT))
+            local dataIdx = i + histFrame.scrollOffset
+            local e = (i <= visibleRows) and entries[dataIdx] or nil
+            if e then
+                row.entry = e
+                row.rowIndex = i
+                row:ClearAllPoints()
+                row:SetPoint("TOPLEFT", listBox, "TOPLEFT", 2, -2 - ((i - 1) * ROW_HEIGHT))
+                row:SetPoint("TOPRIGHT", listBox, "TOPRIGHT", rightPad, -2 - ((i - 1) * ROW_HEIGHT))
 
-                    if i % 2 == 0 then
-                        row.bg:SetColorTexture(0.11, 0.11, 0.11, 0.65)
-                    else
-                        row.bg:SetColorTexture(0.07, 0.07, 0.07, 0.40)
-                    end
-
-                    -- Preserve persistent hover highlight across 1s updates & scroll events
-                    if row.isHovered or row:IsMouseOver() then
-                        row.isHovered = true
-                        row.hoverTex:SetColorTexture(r, g, b, 0.28)
-                        row.hoverTex:Show()
-                    else
-                        row.hoverTex:Hide()
-                    end
-
-                    LayoutColumns(row, false, listWidth)
-
-                    row.cNum:SetText(string.format("|cff888888%d|r", item.chronoIndex))
-                    row.cInst:SetText(e.name or "Instance")
-                    row.cInst:SetTextColor(0.95, 0.95, 0.95, 1)
-
-                    row.cChar:SetText(FormatColoredChar(e.char, e.class, e.level))
-                    row.cDate:SetText(e.time and date("%Y-%m-%d %H:%M", e.time) or "-")
-                    row.cDate:SetTextColor(0.82, 0.82, 0.82, 1)
-
-                    local rem = (e.time or 0) + HOUR_SECONDS - now
-                    if rem > 0 then
-                        row.cStatus:SetText(string.format("|cffffaa00Locked (%s)|r", FormatShortDuration(rem)))
-                    else
-                        row.cStatus:SetText("|cff55ff55Expired|r")
-                    end
-
-                    row:Show()
+                if i % 2 == 0 then
+                    row.bg:SetColorTexture(0.11, 0.11, 0.11, 0.65)
                 else
-                    row.entry = nil
-                    row.isHovered = false
-                    row.hoverTex:Hide()
-                    row:Hide()
+                    row.bg:SetColorTexture(0.07, 0.07, 0.07, 0.40)
                 end
+
+                if row.isHovered or row:IsMouseOver() then
+                    row.isHovered = true
+                    row.hoverTex:SetColorTexture(r, g, b, 0.28)
+                    row.hoverTex:Show()
+                else
+                    row.hoverTex:Hide()
+                end
+
+                LayoutColumns(row, listWidth)
+
+                row.cNum:SetText(string.format("|cff888888%d|r", indices[dataIdx]))
+                row.cInst:SetText(e.name or "Instance")
+                row.cInst:SetTextColor(0.95, 0.95, 0.95, 1)
+
+                row.cChar:SetText(FormatColoredChar(e.char, e.class, e.level))
+                row.cDate:SetText(e.time and date("%Y-%m-%d %H:%M", e.time) or "-")
+                row.cDate:SetTextColor(0.82, 0.82, 0.82, 1)
+
+                local rem = (e.time or 0) + HOUR_SECONDS - now
+                if rem > 0 then
+                    row.cStatus:SetText(string.format("|cffffaa00Locked (%s)|r", FormatShortDuration(rem)))
+                else
+                    row.cStatus:SetText("|cff55ff55Expired|r")
+                end
+
+                row:Show()
             else
                 row.entry = nil
                 row.isHovered = false
@@ -1361,7 +1278,7 @@ local function CreateHistoryWindow()
     histFrame:SetScript("OnMouseWheel", function(_, delta)
         local listHeight = listBox:GetHeight() or 200
         local visibleRows = math.max(1, math.floor((listHeight - 4) / ROW_HEIGHT))
-        local maxOffset = math.max(0, #histFrame.filteredList - visibleRows)
+        local maxOffset = math.max(0, #histFrame.filteredEntries - visibleRows)
         if maxOffset <= 0 then return end
         histFrame.scrollOffset = math.max(0, math.min(maxOffset, (histFrame.scrollOffset or 0) - (delta * 2)))
         UpdateHistoryWindow()
@@ -1395,11 +1312,7 @@ end
 
 ToggleHistoryWindow = function()
     CreateHistoryWindow()
-    if histFrame:IsShown() then
-        histFrame:Hide()
-    else
-        histFrame:Show()
-    end
+    histFrame:SetShown(not histFrame:IsShown())
 end
 
 --------------------------------------------------------------------------------
@@ -1410,16 +1323,19 @@ ApplyLayout = function()
     local fontPath = ResolveFontPath()
     local texPath  = ResolveTexturePath()
     local outline  = db.fontOutline or "OUTLINE"
+    local fontSize = db.fontSize or 12
+    local barW     = db.barWidth or 260
+    local barH     = db.barHeight or 16
     local r, g, b  = GetAccentColor()
 
     frame:SetScale(db.scale or 1.0)
-    barContainer:SetSize(db.barWidth or 260, db.barHeight or 16)
-    frame:SetSize(math.max(db.barWidth or 260, 260), (db.barHeight or 16) + ((db.fontSize or 12) * 2) + 14)
+    barContainer:SetSize(barW, barH)
+    frame:SetSize(math.max(barW, 260), barH + (fontSize * 2) + 14)
 
-    if not textTop:SetFont(fontPath, db.fontSize or 12, outline) then
-        textTop:SetFont(STANDARD_TEXT_FONT, db.fontSize or 12, outline)
+    if not textTop:SetFont(fontPath, fontSize, outline) then
+        textTop:SetFont(STANDARD_TEXT_FONT, fontSize, outline)
     end
-    if not unlockLabel:SetFont(fontPath, math.max(9, (db.fontSize or 12) - 2), outline) then
+    if not unlockLabel:SetFont(fontPath, math.max(9, fontSize - 2), outline) then
         unlockLabel:SetFont(STANDARD_TEXT_FONT, 10, "OUTLINE")
     end
     unlockLabel:SetTextColor(r, g, b, 1)
@@ -1432,13 +1348,8 @@ ApplyLayout = function()
     frame:ClearAllPoints()
     frame:SetPoint(db.point or "CENTER", UIParent, db.relativePoint or "CENTER", db.xOfs or 0, db.yOfs or 180)
 
-    if db.locked then
-        unlockLabel:Hide()
-        frame:EnableMouse(db.showTooltip)
-    else
-        unlockLabel:Show()
-        frame:EnableMouse(true)
-    end
+    unlockLabel:SetShown(not db.locked)
+    frame:EnableMouse((not db.locked) or db.showTooltip)
 end
 
 RefreshTheme = function()
@@ -1459,28 +1370,17 @@ frame:SetScript("OnDragStop", function(self)
     self:StopMovingOrSizing()
     if db then
         local point, _, relativePoint, xOfs, yOfs = self:GetPoint()
-        db.point = point
-        db.relativePoint = relativePoint
-        db.xOfs = math.floor(xOfs + 0.5)
-        db.yOfs = math.floor(yOfs + 0.5)
+        db.point, db.relativePoint = point, relativePoint
+        db.xOfs, db.yOfs = math.floor(xOfs + 0.5), math.floor(yOfs + 0.5)
     end
 end)
 
 local function ShouldDisplay(activeCount)
     if not db then return false end
-    if not db.locked then
-        return true
-    end
-    if db.onlyMaxLevel and (UnitLevel("player") or 0) < MAX_LEVEL then
-        return false
-    end
-    if db.onlyInGroup and not IsInGroup() then
-        return false
-    end
-    if activeCount < (db.minInstancesToShow or 1) then
-        return false
-    end
-    return true
+    if not db.locked then return true end
+    if db.onlyMaxLevel and (UnitLevel("player") or 0) < MAX_LEVEL then return false end
+    if db.onlyInGroup and not IsInGroup() then return false end
+    return activeCount >= (db.minInstancesToShow or 1)
 end
 
 UpdateDisplay = function()
@@ -1494,7 +1394,7 @@ UpdateDisplay = function()
     local count = #active
 
     if UpdateMinimapButton then
-        UpdateMinimapButton()
+        UpdateMinimapButton(active)
     end
 
     if not ShouldDisplay(count) then
@@ -1503,18 +1403,17 @@ UpdateDisplay = function()
     end
     frame:Show()
 
+    wipe(remainingList)
     local now = time()
-    local remainingList = {}
 
     if count == 0 and not db.locked then
-        for _, rem in ipairs(PREVIEW_REMAINING) do
-            table.insert(remainingList, rem)
+        for i, rem in ipairs(PREVIEW_REMAINING) do
+            remainingList[i] = rem
         end
         count = #remainingList
     else
-        for _, entry in ipairs(active) do
-            local rem = math.max(0, (entry.time + HOUR_SECONDS) - now)
-            table.insert(remainingList, rem)
+        for i, entry in ipairs(active) do
+            remainingList[i] = math.max(0, (entry.time + HOUR_SECONDS) - now)
         end
     end
 
@@ -1528,10 +1427,9 @@ UpdateDisplay = function()
     if count > 0 then
         local oldestRem = remainingList[1]
         local oldestFrac = math.min(1, math.max(0, oldestRem / HOUR_SECONDS))
-        local fillWidth = math.max(1, innerWidth * (1 - oldestFrac))
 
         barFill:Show()
-        barFill:SetWidth(fillWidth)
+        barFill:SetWidth(math.max(1, innerWidth * (1 - oldestFrac)))
 
         for i = 1, count do
             local frac = math.min(1, math.max(0, remainingList[i] / HOUR_SECONDS))
@@ -1543,12 +1441,9 @@ UpdateDisplay = function()
             tick:Show()
         end
 
-        local instWord = (count == 1) and "instance" or "instances"
-        local line1 = string.format("You have entered %d %s recently.", count, instWord)
-
+        local line1 = string.format("You have entered %d %s recently.", count, (count == 1) and "instance" or "instances")
         if db.alwaysShowTimer or count >= (db.maxInstances or INSTANCE_CAP) then
-            local line2 = string.format("More instances will be available in %s.", FormatTimeRemaining(oldestRem))
-            textTop:SetText(line1 .. "\n" .. line2)
+            textTop:SetText(string.format("%s\nMore instances will be available in %s.", line1, FormatTimeRemaining(oldestRem)))
         else
             textTop:SetText(line1)
         end
@@ -1574,21 +1469,7 @@ frame:SetScript("OnEnter", function(self)
     GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
     GameTooltip:AddLine("Instance History (Last Hour)", r, g, b)
 
-    if #active == 0 then
-        GameTooltip:AddLine("No instances entered in the last hour.", 0.7, 0.7, 0.7)
-    else
-        local now = time()
-        for i, entry in ipairs(active) do
-            local rem = math.max(0, (entry.time + HOUR_SECONDS) - now)
-            local zoneName = entry.name or "Unknown Instance"
-            GameTooltip:AddDoubleLine(
-                string.format("%d. %s", i, zoneName),
-                FormatTimeRemaining(rem),
-                0.92, 0.92, 0.92,
-                0.75, 0.75, 0.75
-            )
-        end
-    end
+    AddActiveLocksToTooltip(active)
 
     GameTooltip:AddLine(" ")
     GameTooltip:AddLine("Type /ih history to view Full Dungeon History.", 0.65, 0.65, 0.65)
@@ -1605,38 +1486,61 @@ end)
 --------------------------------------------------------------------------------
 -- Instance Tracking & Heuristic Detection
 --------------------------------------------------------------------------------
+local function CloneEntry(src, fallbackClass, fallbackLevel)
+    return {
+        name = src.name,
+        mapID = src.mapID,
+        difficulty = src.difficulty,
+        difficultyName = src.difficultyName,
+        time = src.time,
+        char = src.char,
+        class = src.class or fallbackClass,
+        level = src.level or fallbackLevel,
+        zoneUID = src.zoneUID,
+        duration = src.duration or 0,
+    }
+end
+
+local function RemoveFromList(tbl, target)
+    if not tbl or not target then return end
+    for i = #tbl, 1, -1 do
+        if tbl[i] == target then
+            table.remove(tbl, i)
+            return
+        end
+    end
+end
+
+local function FindFullEntry(matchField, matchVal, char)
+    if not db or not db.fullHistory then return nil end
+    for i = #db.fullHistory, 1, -1 do
+        local fe = db.fullHistory[i]
+        if fe and fe[matchField] == matchVal and fe.char == char then
+            return fe
+        end
+    end
+    return nil
+end
+
 local function RecordNewInstance(name, instanceMapID, difficultyID, difficultyName, timestamp, zoneUID)
     local _, playerClass = UnitClass("player")
-    local playerLevel = UnitLevel("player") or 0
-    local entryTime = timestamp or time()
-
     local entry = {
         name = name or "Instance",
         mapID = instanceMapID,
         difficulty = difficultyID,
         difficultyName = difficultyName,
-        time = entryTime,
+        time = timestamp or time(),
         char = charKey,
         class = playerClass,
-        level = playerLevel,
+        level = UnitLevel("player") or 0,
         zoneUID = zoneUID,
         duration = 0,
     }
     table.insert(db.history, entry)
+    table.sort(db.history, SortByEntryTime)
     currentSessionEntry = entry
 
-    local fullEntry = {
-        name = entry.name,
-        mapID = entry.mapID,
-        difficulty = entry.difficulty,
-        difficultyName = entry.difficultyName,
-        time = entry.time,
-        char = entry.char,
-        class = entry.class,
-        level = entry.level,
-        zoneUID = entry.zoneUID,
-        duration = 0,
-    }
+    local fullEntry = CloneEntry(entry)
     table.insert(db.fullHistory, fullEntry)
     currentFullEntry = fullEntry
     pendingReset = false
@@ -1686,13 +1590,9 @@ local function CheckInstanceStatus()
         else
             currentSessionEntry = lastEntry
             currentSessionEntry.name = name
-            for i = #db.fullHistory, 1, -1 do
-                local fe = db.fullHistory[i]
-                if fe and fe.time == lastEntry.time and fe.char == lastEntry.char then
-                    currentFullEntry = fe
-                    currentFullEntry.name = name
-                    break
-                end
+            currentFullEntry = FindFullEntry("time", lastEntry.time, lastEntry.char)
+            if currentFullEntry then
+                currentFullEntry.name = name
             end
         end
     end
@@ -1702,13 +1602,9 @@ local function CheckInstanceStatus()
 end
 
 local function VerifyGUIDZoneUID(guid)
-    if not wasInInstance or not guid or not db then return end
+    if not wasInInstance or not guid or not db or not currentSessionEntry then return end
     local unitType, _, _, _, zoneUID = strsplit("-", guid)
     if (unitType ~= "Creature" and unitType ~= "Vehicle") or not zoneUID then
-        return
-    end
-
-    if not currentSessionEntry then
         return
     end
 
@@ -1716,29 +1612,10 @@ local function VerifyGUIDZoneUID(guid)
         local active = PruneAndGetActiveHistory()
         for _, entry in ipairs(active) do
             if entry ~= currentSessionEntry and entry.zoneUID == zoneUID then
-                for i = #db.history, 1, -1 do
-                    if db.history[i] == currentSessionEntry then
-                        table.remove(db.history, i)
-                        break
-                    end
-                end
-                if currentFullEntry then
-                    for i = #db.fullHistory, 1, -1 do
-                        if db.fullHistory[i] == currentFullEntry then
-                            table.remove(db.fullHistory, i)
-                            break
-                        end
-                    end
-                end
+                RemoveFromList(db.history, currentSessionEntry)
+                RemoveFromList(db.fullHistory, currentFullEntry)
                 currentSessionEntry = entry
-                currentFullEntry = nil
-                for i = #db.fullHistory, 1, -1 do
-                    local fe = db.fullHistory[i]
-                    if fe and fe.zoneUID == zoneUID and fe.char == entry.char then
-                        currentFullEntry = fe
-                        break
-                    end
-                end
+                currentFullEntry = FindFullEntry("zoneUID", zoneUID, entry.char)
                 UpdateDisplay()
                 if UpdateHistoryWindow then UpdateHistoryWindow() end
                 return
@@ -1811,8 +1688,7 @@ local function CreateElvSlider(parent, label, minVal, maxVal, step, formatFunc, 
         valText:SetTextColor(r, g, b, 1)
         fill:SetColorTexture(r, g, b, 0.78)
 
-        local frac = (v - minVal) / math.max(0.0001, (maxVal - minVal))
-        frac = math.min(1, math.max(0, frac))
+        local frac = math.min(1, math.max(0, (v - minVal) / math.max(0.0001, (maxVal - minVal))))
         fill:SetWidth(math.max(1, 228 * frac))
         valText:SetText(formatFunc(v))
     end
@@ -1927,8 +1803,7 @@ local function CreateElvDropdown(parent, label, width, previewType, getItems, ge
         SetElvBorder(menu, r, g, b, 1)
         scrollThumb:SetColorTexture(r, g, b, 0.85)
 
-        local selName = getSelectedName() or ""
-        selectedText:SetText(selName)
+        selectedText:SetText(getSelectedName() or "")
         if previewType == "texture" then
             previewTex:SetTexture(ResolveTexturePath())
             previewTex:SetVertexColor(0.45, 0.45, 0.45, 0.65)
@@ -1942,51 +1817,46 @@ local function CreateElvDropdown(parent, label, width, previewType, getItems, ge
         local r, g, b = GetAccentColor()
         local total = #currentItems
         local visibleRows = math.min(total, MAX_VISIBLE_ROWS)
-        local hasScroll = total > MAX_VISIBLE_ROWS
-        local rightPad = hasScroll and -14 or -2
+        local rightPad = (total > MAX_VISIBLE_ROWS) and -14 or -2
+        local selectedName = getSelectedName()
 
         for i = 1, MAX_VISIBLE_ROWS do
             local row = rows[i]
-            if i <= visibleRows then
-                local itemIndex = i + scrollOffset
-                local item = currentItems[itemIndex]
-                if item then
-                    row:ClearAllPoints()
-                    row:SetPoint("TOPLEFT", menu, "TOPLEFT", 2, -2 - ((i - 1) * ROW_HEIGHT))
-                    row:SetPoint("TOPRIGHT", menu, "TOPRIGHT", rightPad, -2 - ((i - 1) * ROW_HEIGHT))
+            local item = (i <= visibleRows) and currentItems[i + scrollOffset] or nil
+            if item then
+                row:ClearAllPoints()
+                row:SetPoint("TOPLEFT", menu, "TOPLEFT", 2, -2 - ((i - 1) * ROW_HEIGHT))
+                row:SetPoint("TOPRIGHT", menu, "TOPRIGHT", rightPad, -2 - ((i - 1) * ROW_HEIGHT))
 
-                    if previewType == "texture" and item.path then
-                        row.texPreview:SetTexture(item.path)
-                        row.texPreview:SetVertexColor(0.55, 0.55, 0.55, 0.65)
-                        row.texPreview:Show()
-                        ApplyConfiguredFont(row.label, 11)
-                    elseif previewType == "font" and item.path then
-                        row.texPreview:Hide()
-                        if not row.label:SetFont(item.path, 12, db and db.fontOutline or "OUTLINE") then
-                            ApplyConfiguredFont(row.label, 11)
-                        end
-                    else
-                        row.texPreview:Hide()
+                if previewType == "texture" and item.path then
+                    row.texPreview:SetTexture(item.path)
+                    row.texPreview:SetVertexColor(0.55, 0.55, 0.55, 0.65)
+                    row.texPreview:Show()
+                    ApplyConfiguredFont(row.label, 11)
+                elseif previewType == "font" and item.path then
+                    row.texPreview:Hide()
+                    if not row.label:SetFont(item.path, 12, db and db.fontOutline or "OUTLINE") then
                         ApplyConfiguredFont(row.label, 11)
                     end
-
-                    row.label:SetText(item.name)
-                    if item.name == getSelectedName() then
-                        row.label:SetTextColor(r, g, b, 1)
-                    else
-                        row.label:SetTextColor(0.92, 0.92, 0.92, 1)
-                    end
-
-                    row:SetScript("OnClick", function()
-                        onSelect(item)
-                        menu:Hide()
-                        RefreshTheme()
-                    end)
-
-                    row:Show()
                 else
-                    row:Hide()
+                    row.texPreview:Hide()
+                    ApplyConfiguredFont(row.label, 11)
                 end
+
+                row.label:SetText(item.name)
+                if item.name == selectedName then
+                    row.label:SetTextColor(r, g, b, 1)
+                else
+                    row.label:SetTextColor(0.92, 0.92, 0.92, 1)
+                end
+
+                row:SetScript("OnClick", function()
+                    onSelect(item)
+                    menu:Hide()
+                    RefreshTheme()
+                end)
+
+                row:Show()
             elseif row then
                 row:Hide()
             end
@@ -2124,15 +1994,14 @@ local function OpenAccentColorPicker()
     end
 
     if ColorPickerFrame.SetupColorPickerAndShow then
-        local info = {
+        ColorPickerFrame:SetupColorPickerAndShow({
             r = prevR,
             g = prevG,
             b = prevB,
             hasOpacity = false,
             swatchFunc = ApplyPickedColor,
             cancelFunc = CancelPickedColor,
-        }
-        ColorPickerFrame:SetupColorPickerAndShow(info)
+        })
     else
         ColorPickerFrame:Hide()
         ColorPickerFrame.hasOpacity = false
@@ -2281,7 +2150,7 @@ local function CreateOptionsPanel()
         canvas,
         "Minimum Instances to Show",
         0, 5, 1,
-        function(v) return tostring(v) end,
+        tostring,
         function() return db.minInstancesToShow or 1 end,
         function(v) db.minInstancesToShow = v end
     )
@@ -2338,8 +2207,9 @@ local function CreateOptionsPanel()
         "none",
         function() return outlineOptions end,
         function()
+            local cur = db.fontOutline or "OUTLINE"
             for _, opt in ipairs(outlineOptions) do
-                if opt.value == (db.fontOutline or "OUTLINE") then
+                if opt.value == cur then
                     return opt.name
                 end
             end
@@ -2381,14 +2251,13 @@ local function CreateOptionsPanel()
     )
     heightSlider:SetPoint("TOPLEFT", widthSlider, "BOTTOMLEFT", 0, -6)
 
-    -- Dynamic Accent Color & Class Color Controls
     local cbClassColor = CreateElvCheckbox(
         canvas,
         "Use Class Color",
         "Dynamically colors all UI accent elements using the class color of the currently logged-in character.",
         function() return db.useClassColor end,
         function(v) db.useClassColor = v end,
-        function() RefreshTheme() end
+        RefreshTheme
     )
     cbClassColor:SetPoint("TOPLEFT", heightSlider, "BOTTOMLEFT", 0, -8)
 
@@ -2434,26 +2303,13 @@ local function CreateOptionsPanel()
     resetColBtn:SetPoint("LEFT", swatchBtn, "RIGHT", 5, 0)
 
     -- Bottom Action Buttons
-    local openHistBtn = CreateElvButton(canvas, "Full History (/ih history)", 155, 24, function()
-        ToggleHistoryWindow()
-    end)
+    local openHistBtn = CreateElvButton(canvas, "Full History (/ih history)", 155, 24, ToggleHistoryWindow)
     openHistBtn:SetPoint("BOTTOMLEFT", canvas, "BOTTOMLEFT", 16, 14)
 
-    local resetPosBtn = CreateElvButton(canvas, "Reset Bar Pos", 115, 24, function()
-        db.point = defaults.point
-        db.relativePoint = defaults.relativePoint
-        db.xOfs = defaults.xOfs
-        db.yOfs = defaults.yOfs
-        ApplyLayout()
-    end)
+    local resetPosBtn = CreateElvButton(canvas, "Reset Bar Pos", 115, 24, ResetBarPosition)
     resetPosBtn:SetPoint("LEFT", openHistBtn, "RIGHT", 8, 0)
 
-    local clearBtn = CreateElvButton(canvas, "Clear 1h Locks", 115, 24, function()
-        wipe(db.history)
-        currentSessionEntry = nil
-        UpdateDisplay()
-        if UpdateHistoryWindow then UpdateHistoryWindow() end
-    end)
+    local clearBtn = CreateElvButton(canvas, "Clear 1h Locks", 115, 24, ClearActiveHistory)
     clearBtn:SetPoint("LEFT", resetPosBtn, "RIGHT", 8, 0)
 
     local testWarnBtn = CreateElvButton(canvas, "Test 4/5 Warning", 125, 24, function()
@@ -2506,22 +2362,36 @@ end
 --------------------------------------------------------------------------------
 -- Events & Slash Commands
 --------------------------------------------------------------------------------
-frame:RegisterEvent("ADDON_LOADED")
-frame:RegisterEvent("PLAYER_ENTERING_WORLD")
-frame:RegisterEvent("ZONE_CHANGED_NEW_AREA")
-frame:RegisterEvent("PLAYER_LEVEL_UP")
-frame:RegisterEvent("GROUP_ROSTER_UPDATE")
-frame:RegisterEvent("CHAT_MSG_SYSTEM")
-frame:RegisterEvent("CHAT_MSG_PARTY")
-frame:RegisterEvent("CHAT_MSG_PARTY_LEADER")
-frame:RegisterEvent("CHAT_MSG_RAID")
-frame:RegisterEvent("CHAT_MSG_RAID_LEADER")
-frame:RegisterEvent("CHAT_MSG_INSTANCE_CHAT")
-frame:RegisterEvent("CHAT_MSG_INSTANCE_CHAT_LEADER")
-frame:RegisterEvent("CHAT_MSG_ADDON")
-frame:RegisterEvent("NAME_PLATE_UNIT_ADDED")
-frame:RegisterEvent("PLAYER_TARGET_CHANGED")
-frame:RegisterEvent("UPDATE_MOUSEOVER_UNIT")
+local EVENTS = {
+    "ADDON_LOADED",
+    "PLAYER_ENTERING_WORLD",
+    "ZONE_CHANGED_NEW_AREA",
+    "PLAYER_LEVEL_UP",
+    "GROUP_ROSTER_UPDATE",
+    "CHAT_MSG_SYSTEM",
+    "CHAT_MSG_PARTY",
+    "CHAT_MSG_PARTY_LEADER",
+    "CHAT_MSG_RAID",
+    "CHAT_MSG_RAID_LEADER",
+    "CHAT_MSG_INSTANCE_CHAT",
+    "CHAT_MSG_INSTANCE_CHAT_LEADER",
+    "CHAT_MSG_ADDON",
+    "NAME_PLATE_UNIT_ADDED",
+    "PLAYER_TARGET_CHANGED",
+    "UPDATE_MOUSEOVER_UNIT",
+}
+for _, ev in ipairs(EVENTS) do
+    frame:RegisterEvent(ev)
+end
+
+local GROUP_CHAT_EVENTS = {
+    CHAT_MSG_PARTY = true,
+    CHAT_MSG_PARTY_LEADER = true,
+    CHAT_MSG_RAID = true,
+    CHAT_MSG_RAID_LEADER = true,
+    CHAT_MSG_INSTANCE_CHAT = true,
+    CHAT_MSG_INSTANCE_CHAT_LEADER = true,
+}
 
 frame:SetScript("OnEvent", function(self, event, ...)
     if event == "ADDON_LOADED" then
@@ -2531,37 +2401,22 @@ frame:SetScript("OnEvent", function(self, event, ...)
             db = InstanceHistoryDB
             for k, v in pairs(defaults) do
                 if db[k] == nil then
-                    if type(v) == "table" then
-                        db[k] = {}
-                    else
-                        db[k] = v
-                    end
+                    db[k] = (type(v) == "table") and {} or v
                 end
             end
             charKey = GetCharKey()
+            table.sort(db.history, SortByEntryTime)
 
             local _, playerClass = UnitClass("player")
             local playerLevel = UnitLevel("player") or 0
 
-            -- Backfill fullHistory with any existing 1-hour history entries if upgrading
             if #db.fullHistory == 0 and #db.history > 0 then
                 for _, entry in ipairs(db.history) do
-                    table.insert(db.fullHistory, {
-                        name = entry.name,
-                        mapID = entry.mapID,
-                        difficulty = entry.difficulty,
-                        difficultyName = entry.difficultyName,
-                        time = entry.time,
-                        char = entry.char,
-                        class = entry.class or (entry.char == charKey and playerClass or nil),
-                        level = entry.level or (entry.char == charKey and playerLevel or nil),
-                        zoneUID = entry.zoneUID,
-                        duration = entry.duration or 0,
-                    })
+                    local isSelf = (entry.char == charKey)
+                    table.insert(db.fullHistory, CloneEntry(entry, isSelf and playerClass or nil, isSelf and playerLevel or nil))
                 end
             end
 
-            -- Ensure existing fullHistory entries for the current character have class coloring
             if playerClass then
                 for _, fe in ipairs(db.fullHistory) do
                     if fe.char == charKey and not fe.class then
@@ -2609,9 +2464,7 @@ frame:SetScript("OnEvent", function(self, event, ...)
             end
         end
 
-    elseif event == "CHAT_MSG_PARTY" or event == "CHAT_MSG_PARTY_LEADER"
-        or event == "CHAT_MSG_RAID" or event == "CHAT_MSG_RAID_LEADER"
-        or event == "CHAT_MSG_INSTANCE_CHAT" or event == "CHAT_MSG_INSTANCE_CHAT_LEADER" then
+    elseif GROUP_CHAT_EVENTS[event] then
         local msg, sender = ...
         if not msg then return end
         local shortSender = sender and Ambiguate(sender, "none") or nil
@@ -2661,19 +2514,19 @@ SlashCmdList["INSTANCEHISTORY"] = function(msg)
         PrintAddonMsg(string.format("History window is now %s.", db.histLocked and "|cffff5555Locked|r" or "|cff55ff55Unlocked|r"))
     elseif cmd == "lock" or cmd == "unlock" then
         db.locked = not db.locked
-        ApplyLayout()
-        UpdateDisplay()
+        RefreshTheme()
         PrintAddonMsg(string.format("Bar tracker is now %s.", db.locked and "|cffff5555Locked|r" or "|cff55ff55Unlocked|r"))
     elseif cmd == "level" or cmd == "maxlevel" then
         db.onlyMaxLevel = not db.onlyMaxLevel
-        UpdateDisplay()
+        RefreshTheme()
         PrintAddonMsg(string.format("Only show at Level 60: %s", db.onlyMaxLevel and "|cff55ff55ON|r" or "|cffff5555OFF|r"))
     elseif cmd == "group" then
         db.onlyInGroup = not db.onlyInGroup
-        UpdateDisplay()
+        RefreshTheme()
         PrintAddonMsg(string.format("Only show in a Group: %s", db.onlyInGroup and "|cff55ff55ON|r" or "|cffff5555OFF|r"))
     elseif cmd == "announce" then
         db.announceReset = not db.announceReset
+        RefreshTheme()
         PrintAddonMsg(string.format("Announce resets to Party/Raid: %s", db.announceReset and "|cff55ff55ON|r" or "|cffff5555OFF|r"))
     elseif cmd == "classcolor" then
         db.useClassColor = not db.useClassColor
@@ -2682,14 +2535,10 @@ SlashCmdList["INSTANCEHISTORY"] = function(msg)
     elseif cmd == "test" or cmd == "warn" then
         TriggerLimitNotification(4)
     elseif cmd == "reset" then
-        db.point, db.relativePoint, db.xOfs, db.yOfs = defaults.point, defaults.relativePoint, defaults.xOfs, defaults.yOfs
-        ApplyLayout()
+        ResetBarPosition()
         PrintAddonMsg("Position reset to center.")
     elseif cmd == "clear" then
-        wipe(db.history)
-        currentSessionEntry = nil
-        UpdateDisplay()
-        if UpdateHistoryWindow then UpdateHistoryWindow() end
+        ClearActiveHistory()
         PrintAddonMsg("1-hour instance lock history cleared.")
     else
         OpenOptions()
