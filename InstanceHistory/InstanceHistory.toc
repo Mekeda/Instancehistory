@@ -1,0 +1,8 @@
+## Interface: 11509, 16001, 20506, 38002, 50504, 120100, 120105
+## Title: InstanceHistory
+## Notes: Tracks hourly instance history and announces instance resets to party/raid chat.
+## Author: Mek
+## Version: 1.0.0
+## SavedVariables: InstanceHistoryDB
+
+InstanceHistory.lua
