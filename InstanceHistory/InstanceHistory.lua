@@ -87,17 +87,37 @@ local function RegisterThemeCallback(fn)
 end
 
 --------------------------------------------------------------------------------
+-- Secret Value Guards (WoW 12.0 / Forever Client)
+--------------------------------------------------------------------------------
+local function IsSecret(val)
+    if issecretvalue and issecretvalue(val) then
+        return true
+    end
+    if canaccessvalue and not canaccessvalue(val) then
+        return true
+    end
+    return false
+end
+
+local function IsAccessibleString(val)
+    if IsSecret(val) then
+        return false
+    end
+    return type(val) == "string"
+end
+
+--------------------------------------------------------------------------------
 -- Dynamic Accent & Class Color Resolution
 --------------------------------------------------------------------------------
 local function RGBToHex(r, g, b)
     r = math.max(0, math.min(255, math.floor((r or 0) * 255 + 0.5)))
-    g = math.max(0, math.min(255, math.floor((g or 0) * 255 + 0.5)))
+    g = math.max(0, math.min(255, math.floor((g or 0) * 0.5 + (g or 0) * 255)))
     b = math.max(0, math.min(255, math.floor((b or 0) * 255 + 0.5)))
     return string.format("%02x%02x%02x", r, g, b)
 end
 
 local function GetClassColorTable(classFile)
-    if not classFile then return nil end
+    if not IsAccessibleString(classFile) then return nil end
     return (CUSTOM_CLASS_COLORS and CUSTOM_CLASS_COLORS[classFile])
         or (RAID_CLASS_COLORS and RAID_CLASS_COLORS[classFile])
         or (C_ClassColor and C_ClassColor.GetClassColor and C_ClassColor.GetClassColor(classFile))
@@ -215,7 +235,7 @@ end
 -- Helpers & Pattern Matching for Instance Resets
 --------------------------------------------------------------------------------
 local function MakeSystemPattern(globalString, unanchored)
-    if not globalString then return nil end
+    if not IsAccessibleString(globalString) then return nil end
     local body = globalString:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1"):gsub("%%%%s", "(.+)")
     return unanchored and body or ("^" .. body .. "$")
 end
@@ -227,7 +247,11 @@ local PAT_RESET_OFFLINE       = MakeSystemPattern(INSTANCE_RESET_FAILED_OFFLINE,
 local PAT_RESET_ZONING        = MakeSystemPattern(INSTANCE_RESET_FAILED_ZONING, false)
 
 local function GetCharKey()
-    return (UnitName("player") or "Unknown") .. "-" .. (GetRealmName() or "Realm")
+    local name = UnitName("player")
+    local realm = GetRealmName()
+    name = IsAccessibleString(name) and name or "Unknown"
+    realm = IsAccessibleString(realm) and realm or "Realm"
+    return name .. "-" .. realm
 end
 
 local function FormatTimeRemaining(seconds)
@@ -256,10 +280,10 @@ local function FormatShortDuration(seconds)
 end
 
 local function FormatColoredChar(charStr, classFile, level)
-    local shortName = charStr and charStr:match("^([^%-]+)") or (charStr or "Unknown")
+    local shortName = IsAccessibleString(charStr) and charStr:match("^([^%-]+)") or (IsAccessibleString(charStr) and charStr or "Unknown")
     local c = GetClassColorTable(classFile)
     local colorHex = c and (c.colorStr or ("ff" .. RGBToHex(c.r, c.g, c.b))) or "ffcccccc"
-    if level and level > 0 then
+    if type(level) == "number" and not IsSecret(level) and level > 0 then
         return string.format("|c%s%s|r |cff888888(%d)|r", colorHex, shortName, level)
     end
     return string.format("|c%s%s|r", colorHex, shortName)
@@ -328,12 +352,13 @@ local function GetGroupChatChannel()
 end
 
 local function SendGroupChat(msg)
+    if not IsAccessibleString(msg) or IsInInstance() then return end
     local channel = GetGroupChatChannel()
     if not channel then return end
     if C_ChatInfo and C_ChatInfo.SendChatMessage then
-        C_ChatInfo.SendChatMessage(msg, channel)
+        pcall(C_ChatInfo.SendChatMessage, msg, channel)
     elseif SendChatMessage then
-        SendChatMessage(msg, channel)
+        pcall(SendChatMessage, msg, channel)
     end
 end
 
@@ -1375,10 +1400,18 @@ frame:SetScript("OnDragStop", function(self)
     end
 end)
 
+local function GetSafePlayerLevel()
+    local lvl = UnitLevel("player")
+    if IsSecret(lvl) or type(lvl) ~= "number" then
+        return 0
+    end
+    return lvl
+end
+
 local function ShouldDisplay(activeCount)
     if not db then return false end
     if not db.locked then return true end
-    if db.onlyMaxLevel and (UnitLevel("player") or 0) < MAX_LEVEL then return false end
+    if db.onlyMaxLevel and GetSafePlayerLevel() < MAX_LEVEL then return false end
     if db.onlyInGroup and not IsInGroup() then return false end
     return activeCount >= (db.minInstancesToShow or 1)
 end
@@ -1512,7 +1545,7 @@ local function RemoveFromList(tbl, target)
 end
 
 local function FindFullEntry(matchField, matchVal, char)
-    if not db or not db.fullHistory then return nil end
+    if not db or not db.fullHistory or IsSecret(matchVal) then return nil end
     for i = #db.fullHistory, 1, -1 do
         local fe = db.fullHistory[i]
         if fe and fe[matchField] == matchVal and fe.char == char then
@@ -1524,16 +1557,18 @@ end
 
 local function RecordNewInstance(name, instanceMapID, difficultyID, difficultyName, timestamp, zoneUID)
     local _, playerClass = UnitClass("player")
+    if not IsAccessibleString(playerClass) then playerClass = nil end
+
     local entry = {
-        name = name or "Instance",
-        mapID = instanceMapID,
-        difficulty = difficultyID,
-        difficultyName = difficultyName,
+        name = IsAccessibleString(name) and name or "Instance",
+        mapID = not IsSecret(instanceMapID) and instanceMapID or nil,
+        difficulty = not IsSecret(difficultyID) and difficultyID or nil,
+        difficultyName = IsAccessibleString(difficultyName) and difficultyName or nil,
         time = timestamp or time(),
         char = charKey,
         class = playerClass,
-        level = UnitLevel("player") or 0,
-        zoneUID = zoneUID,
+        level = GetSafePlayerLevel(),
+        zoneUID = IsAccessibleString(zoneUID) and zoneUID or nil,
         duration = 0,
     }
     table.insert(db.history, entry)
@@ -1557,6 +1592,8 @@ end
 local function CheckInstanceStatus()
     if not db then return end
     local inInstance, instanceType = IsInInstance()
+    if IsSecret(inInstance) or IsSecret(instanceType) then return end
+
     local isTrackedType = inInstance and (instanceType == "party" or instanceType == "raid")
 
     if not isTrackedType then
@@ -1573,10 +1610,14 @@ local function CheckInstanceStatus()
     end
 
     local name, _, difficultyID, difficultyName, _, _, _, instanceMapID = GetInstanceInfo()
-    if not name or name == "" then
+    if not IsAccessibleString(name) or name == "" then
         C_Timer.After(0.5, CheckInstanceStatus)
         return
     end
+
+    if IsSecret(difficultyID) then difficultyID = nil end
+    if not IsAccessibleString(difficultyName) then difficultyName = nil end
+    if IsSecret(instanceMapID) then instanceMapID = nil end
 
     if not wasInInstance then
         wasInInstance = true
@@ -1602,9 +1643,12 @@ local function CheckInstanceStatus()
 end
 
 local function VerifyGUIDZoneUID(guid)
-    if not wasInInstance or not guid or not db or not currentSessionEntry then return end
+    if not wasInInstance or not db or not currentSessionEntry or not IsAccessibleString(guid) then
+        return
+    end
+
     local unitType, _, _, _, zoneUID = strsplit("-", guid)
-    if (unitType ~= "Creature" and unitType ~= "Vehicle") or not zoneUID then
+    if (unitType ~= "Creature" and unitType ~= "Vehicle") or not IsAccessibleString(zoneUID) then
         return
     end
 
@@ -2396,43 +2440,46 @@ local GROUP_CHAT_EVENTS = {
 frame:SetScript("OnEvent", function(self, event, ...)
     if event == "ADDON_LOADED" then
         local loadedName = ...
-        if loadedName == addonName then
-            InstanceHistoryDB = InstanceHistoryDB or {}
-            db = InstanceHistoryDB
-            for k, v in pairs(defaults) do
-                if db[k] == nil then
-                    db[k] = (type(v) == "table") and {} or v
-                end
-            end
-            charKey = GetCharKey()
-            table.sort(db.history, SortByEntryTime)
-
-            local _, playerClass = UnitClass("player")
-            local playerLevel = UnitLevel("player") or 0
-
-            if #db.fullHistory == 0 and #db.history > 0 then
-                for _, entry in ipairs(db.history) do
-                    local isSelf = (entry.char == charKey)
-                    table.insert(db.fullHistory, CloneEntry(entry, isSelf and playerClass or nil, isSelf and playerLevel or nil))
-                end
-            end
-
-            if playerClass then
-                for _, fe in ipairs(db.fullHistory) do
-                    if fe.char == charKey and not fe.class then
-                        fe.class = playerClass
-                    end
-                end
-            end
-
-            if C_ChatInfo and C_ChatInfo.RegisterAddonMessagePrefix then
-                C_ChatInfo.RegisterAddonMessagePrefix("InstHist")
-            end
-            CreateOptionsPanel()
-            CreateHistoryWindow()
-            CreateMinimapButton()
-            RefreshTheme()
+        if not IsAccessibleString(loadedName) or loadedName ~= addonName then
+            return
         end
+
+        InstanceHistoryDB = InstanceHistoryDB or {}
+        db = InstanceHistoryDB
+        for k, v in pairs(defaults) do
+            if db[k] == nil then
+                db[k] = (type(v) == "table") and {} or v
+            end
+        end
+        charKey = GetCharKey()
+        table.sort(db.history, SortByEntryTime)
+
+        local _, playerClass = UnitClass("player")
+        if not IsAccessibleString(playerClass) then playerClass = nil end
+        local playerLevel = GetSafePlayerLevel()
+
+        if #db.fullHistory == 0 and #db.history > 0 then
+            for _, entry in ipairs(db.history) do
+                local isSelf = (entry.char == charKey)
+                table.insert(db.fullHistory, CloneEntry(entry, isSelf and playerClass or nil, isSelf and playerLevel or nil))
+            end
+        end
+
+        if playerClass then
+            for _, fe in ipairs(db.fullHistory) do
+                if fe.char == charKey and not fe.class then
+                    fe.class = playerClass
+                end
+            end
+        end
+
+        if C_ChatInfo and C_ChatInfo.RegisterAddonMessagePrefix then
+            C_ChatInfo.RegisterAddonMessagePrefix("InstHist")
+        end
+        CreateOptionsPanel()
+        CreateHistoryWindow()
+        CreateMinimapButton()
+        RefreshTheme()
 
     elseif event == "PLAYER_ENTERING_WORLD" or event == "ZONE_CHANGED_NEW_AREA" then
         if db and db.useClassColor then
@@ -2445,13 +2492,13 @@ frame:SetScript("OnEvent", function(self, event, ...)
 
     elseif event == "CHAT_MSG_SYSTEM" then
         local msg = ...
-        if not msg then return end
+        if not IsAccessibleString(msg) then return end
 
         if PAT_RESET_SUCCESS and msg:match(PAT_RESET_SUCCESS) then
             pendingReset = true
             local channel = GetGroupChatChannel()
-            if channel and C_ChatInfo and C_ChatInfo.SendAddonMessage then
-                C_ChatInfo.SendAddonMessage("InstHist", "RESET", channel)
+            if channel and not IsInInstance() and C_ChatInfo and C_ChatInfo.SendAddonMessage then
+                pcall(C_ChatInfo.SendAddonMessage, "InstHist", "RESET", channel)
             end
             if db and db.announceReset then
                 SendGroupChat(msg)
@@ -2466,9 +2513,15 @@ frame:SetScript("OnEvent", function(self, event, ...)
 
     elseif GROUP_CHAT_EVENTS[event] then
         local msg, sender = ...
-        if not msg then return end
-        local shortSender = sender and Ambiguate(sender, "none") or nil
-        if shortSender ~= UnitName("player") then
+        if not IsAccessibleString(msg) then return end
+
+        local shortSender = IsAccessibleString(sender) and Ambiguate(sender, "none") or nil
+        local playerName = UnitName("player")
+        local isOtherPlayer = not IsAccessibleString(shortSender)
+            or not IsAccessibleString(playerName)
+            or shortSender ~= playerName
+
+        if isOtherPlayer then
             if (PAT_RESET_SUCCESS_LOOSE and msg:match(PAT_RESET_SUCCESS_LOOSE)) or msg:lower():find("has been reset", 1, true) then
                 pendingReset = true
             end
@@ -2476,29 +2529,34 @@ frame:SetScript("OnEvent", function(self, event, ...)
 
     elseif event == "CHAT_MSG_ADDON" then
         local prefix, text, _, sender = ...
+        if not IsAccessibleString(prefix) or not IsAccessibleString(text) then return end
+
         if prefix == "InstHist" and text == "RESET" then
-            local shortSender = sender and Ambiguate(sender, "none") or nil
-            if shortSender ~= UnitName("player") then
+            local shortSender = IsAccessibleString(sender) and Ambiguate(sender, "none") or nil
+            local playerName = UnitName("player")
+            if not IsAccessibleString(shortSender) or not IsAccessibleString(playerName) or shortSender ~= playerName then
                 pendingReset = true
             end
         end
 
     elseif event == "NAME_PLATE_UNIT_ADDED" then
         local unit = ...
-        if unit then VerifyGUIDZoneUID(UnitGUID(unit)) end
+        if IsAccessibleString(unit) then
+            VerifyGUIDZoneUID(UnitGUID(unit))
+        end
 
     elseif event == "PLAYER_TARGET_CHANGED" then
-        if UnitExists("target") then VerifyGUIDZoneUID(UnitGUID("target")) end
+        VerifyGUIDZoneUID(UnitGUID("target"))
 
     elseif event == "UPDATE_MOUSEOVER_UNIT" then
-        if UnitExists("mouseover") then VerifyGUIDZoneUID(UnitGUID("mouseover")) end
+        VerifyGUIDZoneUID(UnitGUID("mouseover"))
     end
 end)
 
 SLASH_INSTANCEHISTORY1 = "/ih"
 SLASH_INSTANCEHISTORY2 = "/instancehistory"
 SlashCmdList["INSTANCEHISTORY"] = function(msg)
-    local cmd = (msg or ""):lower():match("^%s*(%S*)")
+    local cmd = IsAccessibleString(msg) and msg:lower():match("^%s*(%S*)") or ""
     if cmd == "history" or cmd == "log" then
         ToggleHistoryWindow()
     elseif cmd == "minimap" or cmd == "mm" then
