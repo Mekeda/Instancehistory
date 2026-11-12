@@ -2,7 +2,8 @@ local addonName, ns = ...
 
 local HOUR_SECONDS = 3600
 local MAX_LEVEL = 60
-local INSTANCE_CAP = 5
+local INSTANCE_CAP = 10
+local INSTANCE_WARN = 9
 
 local DEFAULT_ACCENT = { r = 0.09, g = 0.52, b = 0.82 }
 local DEFAULT_BAR_TEX = "Interface\\TargetingFrame\\UI-StatusBar"
@@ -21,7 +22,7 @@ local defaults = {
     accountWide = false,
     showTooltip = true,
     minInstancesToShow = 1,
-    maxInstances = 5,
+    maxInstances = INSTANCE_CAP,
     barWidth = 260,
     barHeight = 16,
     fontSize = 12,
@@ -111,7 +112,7 @@ end
 --------------------------------------------------------------------------------
 local function RGBToHex(r, g, b)
     r = math.max(0, math.min(255, math.floor((r or 0) * 255 + 0.5)))
-    g = math.max(0, math.min(255, math.floor((g or 0) * 0.5 + (g or 0) * 255)))
+    g = math.max(0, math.min(255, math.floor((g or 0) * 255 + 0.5)))
     b = math.max(0, math.min(255, math.floor((b or 0) * 255 + 0.5)))
     return string.format("%02x%02x%02x", r, g, b)
 end
@@ -369,10 +370,10 @@ end
 
 local function TriggerLimitNotification(count)
     local msg
-    if count == 4 then
+    if count == INSTANCE_WARN then
         msg = "You are nearing the instances per hour limit."
     elseif count >= INSTANCE_CAP then
-        msg = "You have reached the 5 instances per hour limit!"
+        msg = string.format("You have reached the %d instances per hour limit!", INSTANCE_CAP)
     else
         return
     end
@@ -650,7 +651,7 @@ local function ShowMinimapTooltip(self, precomputedActive)
     GameTooltip:SetOwner(self, "ANCHOR_LEFT")
     GameTooltip:AddDoubleLine(
         string.format("|cff%sInstance|rHistory", hex),
-        string.format("|cff%s%d/%d|r Locks (1h)", (count >= INSTANCE_CAP and "ff4444" or (count == 4 and "ffcc00" or hex)), count, INSTANCE_CAP),
+        string.format("|cff%s%d/%d|r Locks (1h)", (count >= INSTANCE_CAP and "ff4444" or (count == INSTANCE_WARN and "ffcc00" or hex)), count, INSTANCE_CAP),
         1, 1, 1, 0.85, 0.85, 0.85
     )
 
@@ -796,7 +797,7 @@ UpdateMinimapButton = function(precomputedActive)
     if count > 0 then
         if count >= INSTANCE_CAP then
             minimapBtn.badgeText:SetTextColor(1, 0.25, 0.25, 1)
-        elseif count == 4 then
+        elseif count == INSTANCE_WARN then
             minimapBtn.badgeText:SetTextColor(1, 0.80, 0, 1)
         else
             minimapBtn.badgeText:SetTextColor(0.35, 1, 0.35, 1)
@@ -1581,7 +1582,7 @@ local function RecordNewInstance(name, instanceMapID, difficultyID, difficultyNa
     pendingReset = false
 
     local active = PruneAndGetActiveHistory()
-    if db.notifyNearLimit and (#active == 4 or #active >= INSTANCE_CAP) then
+    if db.notifyNearLimit and (#active == INSTANCE_WARN or #active >= INSTANCE_CAP) then
         TriggerLimitNotification(#active)
     end
 
@@ -2079,7 +2080,7 @@ local function CreateOptionsPanel()
     ApplyConfiguredFont(subtitle, 11)
     subtitle:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -4)
     subtitle:SetTextColor(0.7, 0.7, 0.7, 1)
-    subtitle:SetText("Hourly instance lock tracker (5/hr cap), full run log (/ih history) & reset announcer.")
+    subtitle:SetText("Hourly instance lock tracker (10/hr cap), full run log (/ih history) & reset announcer.")
 
     local headerLine = canvas:CreateTexture(nil, "ARTWORK")
     headerLine:SetPoint("TOPLEFT", subtitle, "BOTTOMLEFT", 0, -8)
@@ -2152,7 +2153,7 @@ local function CreateOptionsPanel()
 
     local cb4 = OptCheckbox(
         "Notify When Approaching Instance Cap",
-        "Displays 'You are nearing the instances per hour limit.' when you enter your 4th instance within the hour.",
+        "Displays 'You are nearing the instances per hour limit.' when you enter your 9th instance within the hour.",
         function() return db.notifyNearLimit end,
         function(v) db.notifyNearLimit = v end
     )
@@ -2193,7 +2194,7 @@ local function CreateOptionsPanel()
     local minSlider = CreateElvSlider(
         canvas,
         "Minimum Instances to Show",
-        0, 5, 1,
+        0, INSTANCE_CAP, 1,
         tostring,
         function() return db.minInstancesToShow or 1 end,
         function(v) db.minInstancesToShow = v end
@@ -2356,8 +2357,8 @@ local function CreateOptionsPanel()
     local clearBtn = CreateElvButton(canvas, "Clear 1h Locks", 115, 24, ClearActiveHistory)
     clearBtn:SetPoint("LEFT", resetPosBtn, "RIGHT", 8, 0)
 
-    local testWarnBtn = CreateElvButton(canvas, "Test 4/5 Warning", 125, 24, function()
-        TriggerLimitNotification(4)
+    local testWarnBtn = CreateElvButton(canvas, "Test Notification", 125, 24, function()
+        TriggerLimitNotification(INSTANCE_WARN)
     end)
     testWarnBtn:SetPoint("LEFT", clearBtn, "RIGHT", 8, 0)
 
@@ -2450,6 +2451,9 @@ frame:SetScript("OnEvent", function(self, event, ...)
             if db[k] == nil then
                 db[k] = (type(v) == "table") and {} or v
             end
+        end
+        if db.maxInstances == 5 then
+            db.maxInstances = INSTANCE_CAP
         end
         charKey = GetCharKey()
         table.sort(db.history, SortByEntryTime)
@@ -2591,7 +2595,7 @@ SlashCmdList["INSTANCEHISTORY"] = function(msg)
         RefreshTheme()
         PrintAddonMsg(string.format("Use Class Color: %s", db.useClassColor and "|cff55ff55ON|r" or "|cffff5555OFF|r"))
     elseif cmd == "test" or cmd == "warn" then
-        TriggerLimitNotification(4)
+        TriggerLimitNotification(INSTANCE_WARN)
     elseif cmd == "reset" then
         ResetBarPosition()
         PrintAddonMsg("Position reset to center.")
